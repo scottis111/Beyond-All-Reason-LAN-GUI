@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Awesome BAR LAN Lobby - Windows compatible build.
+"""Awesome BAR LAN Lobby - Arch Linux / Linux build.
 
 Direct-connect host/join launcher for Beyond All Reason with up to 8 human players,
 bots (Skirmish AI and Lua AI such as Scavengers/Raptors), teams, start boxes, and
 available game/map options read from the installed Spring engine's unitsync library.
 
-Requires Python 3 and PyQt6: python -m pip install PyQt6
+On Arch Linux, install the runtime dependencies with:
+    sudo pacman -S --needed python python-pyqt6
 """
 import array
 import ipaddress
@@ -1135,8 +1136,9 @@ class MainWindow(QMainWindow):
                     "The BAR data folder should contain an engine subfolder. If BAR updates to another engine version, "
                     "click Detect engine or choose the new engine folder.")
         else:
-            hint = ("Default data folder is ~/.local/state/Beyond All Reason. If BAR updates to another engine "
-                    "version, click Detect engine or select the new engine folder here.")
+            hint = ("Default data folder is ~/.local/state/Beyond All Reason (the usual Linux BAR launcher location). "
+                    "The folder should contain an engine/ subfolder. If BAR updates to another engine version, "
+                    "click Detect engine or select the new engine folder here.")
         g.addWidget(self.hint(hint), 4, 0, 1, 2)
         row = QHBoxLayout()
         row.addWidget(self.button("Save settings", self.on_save_settings))
