@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Awesome BAR LAN Lobby - Linux (Arch) port.
+"""Awesome BAR LAN Lobby - Windows compatible build.
 
 Direct-connect host/join launcher for Beyond All Reason with up to 8 human players,
-bots (Skirmish AI and Lua AI such as Scavengers/Raptors), teams, start boxes, and every
-game/map option your installed BAR version defines (read live through unitsync).
+bots (Skirmish AI and Lua AI such as Scavengers/Raptors), teams, start boxes, and
+available game/map options read from the installed Spring engine's unitsync library.
 
-Needs: python, python-pyqt6   (sudo pacman -S python python-pyqt6)
+Requires Python 3 and PyQt6: python -m pip install PyQt6
 """
 import array
 import ipaddress
@@ -23,9 +23,16 @@ import zlib
 from pathlib import Path
 
 APP_NAME = "awesome-bar-lan"
-DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
-CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    # Keep generated files/cache in LocalAppData and user settings in Roaming AppData.
+    DATA_HOME = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+    CONFIG_HOME = Path(os.environ.get("APPDATA") or Path.home() / "AppData/Roaming")
+    STATE_HOME = DATA_HOME
+else:
+    DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
 APP_DIR = DATA_HOME / APP_NAME
 GENERATED_DIR = APP_DIR / "GeneratedScripts"
 MAPCACHE_DIR = APP_DIR / "MapCache"
@@ -208,15 +215,30 @@ def scan_main(engine_dir, data_dir, out_dir):
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    lib_path = Path(engine_dir) / "libunitsync.so"
+    engine_path = Path(engine_dir)
+    lib_name = "unitsync.dll" if IS_WINDOWS else "libunitsync.so"
+    lib_path = engine_path / lib_name
     if not lib_path.is_file():
-        print(f"ERROR libunitsync.so was not found in: {engine_dir}")
+        print(f"ERROR {lib_name} was not found in: {engine_dir}")
         return 2
     os.environ["SPRING_DATADIR"] = data_dir
+    dll_directory_handle = None
+    if IS_WINDOWS:
+        # The BAR engine ships DLL dependencies next to unitsync.dll. Windows does not
+        # search the library's directory for dependencies in every Python setup unless
+        # the directory is added explicitly.
+        os.environ["PATH"] = str(engine_path) + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            try:
+                dll_directory_handle = os.add_dll_directory(str(engine_path))
+            except OSError:
+                dll_directory_handle = None
     try:
         lib = ctypes.CDLL(str(lib_path))
     except OSError as e:
-        print(f"ERROR could not load libunitsync.so: {e}")
+        print(f"ERROR could not load {lib_name}: {e}")
+        if IS_WINDOWS:
+            print("Hint: use the matching 64-bit Python and keep the BAR engine DLL files together.")
         return 2
     lib.Init.argtypes = [ctypes.c_bool, ctypes.c_int]
     lib.Init.restype = ctypes.c_int
@@ -314,6 +336,38 @@ def run_cmd(cmd, timeout=5):
 
 
 def get_lan_ipv4():
+    # Windows has no built-in `ip` command with the Linux flags used below. Ask
+    # PowerShell for an address on the best-metric physical interface first, then
+    # fall back to Python's socket APIs if PowerShell is unavailable.
+    if IS_WINDOWS:
+        ps = (
+            "$skip='(?i)(Proton|VPN|WireGuard|Wintun|TAP|TUN|Tailscale|ZeroTier|"
+            "VirtualBox|VMware|Hyper-V|vEthernet|Docker|WSL)'; "
+            "$c=Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.IPv4Address "
+            "-and $_.InterfaceAlias -notmatch $skip } | "
+            "Sort-Object { $_.NetAdapter.InterfaceMetric }; "
+            "if($c){$c[0].IPv4Address[0].IPAddress}"
+        )
+        text = run_cmd(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], timeout=8).strip()
+        for line in text.splitlines():
+            try:
+                addr = ipaddress.ip_address(line.strip())
+                if isinstance(addr, ipaddress.IPv4Address) and not addr.is_loopback and not addr.is_link_local:
+                    return str(addr)
+            except ValueError:
+                continue
+        found = []
+        try:
+            for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+                addr = item[4][0]
+                parsed = ipaddress.ip_address(addr)
+                if isinstance(parsed, ipaddress.IPv4Address) and not parsed.is_loopback and not parsed.is_link_local:
+                    found.append(str(parsed))
+        except OSError:
+            pass
+        private = [a for a in found if ipaddress.ip_address(a).is_private]
+        return (private or found or [""])[0]
+
     skip = re.compile(r"^(lo|proton|pvpn|ipv6leak|tun|tap|wg|docker|br-|veth|virbr|vmnet|tailscale|zt)", re.I)
     default_ifaces = set()
     for line in run_cmd(["ip", "-4", "route", "show", "default"]).splitlines():
@@ -346,6 +400,10 @@ def get_public_ipv4():
 
 
 def get_proton_iface():
+    # The Proton adapter name and forwarded-port discovery below are Linux-specific.
+    # On Windows, the user can enter the currently assigned Proton port in Host port.
+    if IS_WINDOWS:
+        return None
     for line in run_cmd(["ip", "-o", "link", "show", "up"]).splitlines():
         parts = line.split()
         if len(parts) >= 2:
@@ -685,7 +743,9 @@ class OptionsPanel(QWidget):
 # Players / bots / teams table
 # ---------------------------------------------------------------------------
 class PlayerTable(QTableWidget):
-    COLS = ["Type", "Name", "Password", "Team", "Bot / AI", "Bonus %", "Side", "Color"]
+    # One host-controlled shared password lives above this table; passwords are not per-player.
+    COLS = ["Type", "Name", "Team", "Bot / AI", "Bonus %", "Side", "Color"]
+    FACTIONS = ["Armada", "Cortex", "Legion", "Awesome"]
     KINDS = [("Player", "human"), ("Spectator", "spec"), ("Bot (Skirmish AI)", "ai"),
              ("Scavengers / Raptors (Lua AI)", "luaai")]
 
@@ -696,7 +756,7 @@ class PlayerTable(QTableWidget):
         self.setHorizontalHeaderLabels(self.COLS)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        for i, w in enumerate((200, 150, 110, 65, 210, 80, 110, 55)):
+        for i, w in enumerate((165, 175, 65, 235, 80, 120, 55)):
             self.setColumnWidth(i, w)
 
     # ----- helpers -----
@@ -729,28 +789,63 @@ class PlayerTable(QTableWidget):
             self.paint_color(r)
 
     def fill_side_combo(self, r, keep=True):
+        """Fill the faction list with the four factions requested for this BAR build."""
         cb = r["side"]
         cur = cb.currentText() if keep else ""
         cb.blockSignals(True)
         cb.clear()
-        cb.addItems(self.win.game_info.get("sides", []))
-        cb.setEditText(cur or self.win.default_side())
+        cb.addItems(self.FACTIONS)
+        target = cur if cur in self.FACTIONS else self.win.default_side()
+        idx = cb.findText(target)
+        cb.setCurrentIndex(idx if idx >= 0 else 0)
         cb.blockSignals(False)
 
     def fill_ai_combo(self, r, keep=True):
+        """Populate a real dropdown even if unitsync has not loaded its AI metadata yet."""
         cb = r["ai"]
         kind = self.kind_of(r)
         cur = cb.currentText().strip() if keep else ""
         cb.blockSignals(True)
         cb.clear()
+
         if kind == "ai":
-            for a in self.win.game_info.get("skirmish_ais", []):
-                label = f"{a.get('name') or a.get('shortName')} {a.get('version', '')}".strip()
-                cb.addItem(label, ("ai", a.get("shortName", ""), a.get("version", "")))
+            ais = self.win.game_info.get("skirmish_ais", [])
+            for a in ais:
+                short_name = a.get("shortName", "").strip()
+                if not short_name:
+                    continue
+                display_name = a.get("name") or short_name
+                version = a.get("version", "")
+                label = f"{display_name} {version}".strip()
+                cb.addItem(label, ("ai", short_name, version))
+            if cb.count() == 0:
+                # Common Recoil/BAR engine AI identifiers. They are fallbacks only;
+                # a successful unitsync scan replaces them with the installed list.
+                for short_name, label in (("BARb", "BARb (built-in)"),
+                                          ("CircuitAI", "CircuitAI"),
+                                          ("NullAI", "NullAI (no-op)")):
+                    cb.addItem(label, ("ai", short_name, ""))
+
         elif kind == "luaai":
-            for a in self.win.game_info.get("lua_ais", []):
-                cb.addItem(a["name"], ("luaai", a["name"]))
-        cb.setEditText(cur if cur else (cb.itemText(0) if cb.count() else ""))
+            lua_ais = self.win.game_info.get("lua_ais", [])
+            for a in lua_ais:
+                name = str(a.get("name", "")).strip()
+                if name:
+                    cb.addItem(name, ("luaai", name))
+            if cb.count() == 0:
+                # BAR Lua AI names commonly available in current game data.
+                for name in ("SimpleAI", "SimpleDefenderAI", "SimpleConstructorAI", "ScavengersAI", "RaptorsAI"):
+                    cb.addItem(name, ("luaai", name))
+
+        # Preserve a saved selection where possible; otherwise select the first usable option.
+        if cur:
+            for i in range(cb.count()):
+                data = cb.itemData(i)
+                if cb.itemText(i) == cur or (isinstance(data, tuple) and len(data) > 1 and data[1] == cur):
+                    cb.setCurrentIndex(i)
+                    break
+        if cb.count() and cb.currentIndex() < 0:
+            cb.setCurrentIndex(0)
         cb.blockSignals(False)
 
     def ai_choice(self, r):
@@ -768,14 +863,11 @@ class PlayerTable(QTableWidget):
         kind = self.kind_of(r)
         is_human = kind in ("host", "human", "spec")
         is_bot = kind in ("ai", "luaai")
-        r["pass"].setEnabled(kind in ("human", "spec"))
         r["ai"].setEnabled(is_bot)
         r["team"].setEnabled(kind != "spec")
         r["bonus"].setEnabled(kind != "spec")
         r["side"].setEnabled(kind != "spec")
         r["colorbtn"].setEnabled(kind != "spec")
-        if not is_bot:
-            r["ai"].setEditText("")
         return is_human
 
     def on_kind_changed(self, r):
@@ -786,8 +878,7 @@ class PlayerTable(QTableWidget):
             self.on_ai_changed(r)
         if kind in ("human", "spec") and r["auto_name"]:
             r["name"].setText(self.unique_name("Friend"))
-        if kind in ("human", "spec") and not r["pass"].text():
-            r["pass"].setText(secrets.token_hex(3))
+        # All human players and spectators use the host's shared join password.
 
     def on_ai_changed(self, r):
         if self.kind_of(r) in ("ai", "luaai") and r["auto_name"]:
@@ -817,36 +908,48 @@ class PlayerTable(QTableWidget):
             r["type"] = cb
         r["name"] = QLineEdit(name)
         r["name"].textEdited.connect(lambda _=None, rr=r: rr.__setitem__("auto_name", False))
-        r["pass"] = QLineEdit(password)
         r["team"] = QSpinBox()
         r["team"].setRange(1, MAX_SLOTS)
         nonspec = sum(1 for x in self.rows if self.kind_of(x) != "spec")
         r["team"].setValue(ally if ally else 1 + (nonspec % 2))
         r["ai"] = QComboBox()
-        r["ai"].setEditable(True)
+        r["ai"].setEditable(False)
         r["ai"].setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        r["ai"].setMinimumContentsLength(12)
+        r["ai"].setMaxVisibleItems(20)
         r["ai"].currentTextChanged.connect(lambda _=None, rr=r: self.on_ai_changed(rr))
         r["bonus"] = QSpinBox()
         r["bonus"].setRange(-100, 1000)
         r["bonus"].setValue(bonus)
         r["bonus"].setToolTip("Resource bonus/handicap in percent (0 = normal).")
         r["side"] = QComboBox()
-        r["side"].setEditable(True)
+        r["side"].setEditable(False)
         r["color"] = tuple(color) if color else PALETTE[len(self.rows) % len(PALETTE)]
         r["colorbtn"] = QPushButton()
         r["colorbtn"].clicked.connect(lambda _=False, rr=r: self.pick_color(rr))
-        for col, key in enumerate(("type", "name", "pass", "team", "ai", "bonus", "side", "colorbtn")):
+        for col, key in enumerate(("type", "name", "team", "ai", "bonus", "side", "colorbtn")):
             self.setCellWidget(row, col, r[key])
         self.rows.append(r)
         self.paint_color(r)
         self.fill_side_combo(r, keep=False)
         if side:
-            r["side"].setEditText(side)
+            side_index = r["side"].findText(str(side))
+            if side_index >= 0:
+                r["side"].setCurrentIndex(side_index)
         self.apply_kind_state(r)
         if kind in ("ai", "luaai"):
             self.fill_ai_combo(r, keep=False)
             if ai:
-                r["ai"].setEditText(ai)
+                ai_text = str(ai).strip()
+                ai_index = r["ai"].findText(ai_text)
+                if ai_index < 0:
+                    for i in range(r["ai"].count()):
+                        data = r["ai"].itemData(i)
+                        if isinstance(data, tuple) and len(data) > 1 and data[1] == ai_text:
+                            ai_index = i
+                            break
+                if ai_index >= 0:
+                    r["ai"].setCurrentIndex(ai_index)
             self.on_ai_changed(r)
         elif not name:
             r["name"].setText(self.unique_name("Friend" if kind == "human" else "Spectator"))
@@ -891,9 +994,10 @@ class PlayerTable(QTableWidget):
 
     def slots(self):
         out = []
+        shared_password = self.win.tb_host_password.text()
         for r in self.rows:
             kind = self.kind_of(r)
-            out.append({"kind": kind, "name": r["name"].text().strip(), "password": r["pass"].text(),
+            out.append({"kind": kind, "name": r["name"].text().strip(), "password": shared_password,
                         "ally": r["team"].value(), "ai": self.ai_choice(r) if kind in ("ai", "luaai") else None,
                         "ai_text": r["ai"].currentText().strip(), "bonus": r["bonus"].value(),
                         "side": r["side"].currentText().strip(), "color": r["color"]})
@@ -997,15 +1101,21 @@ class MainWindow(QMainWindow):
         return b
 
     def default_side(self):
-        sides = self.game_info.get("sides", [])
-        if "Awesome" in sides or not sides:
-            return "Awesome"
-        return sides[0]
+        return "Awesome"
 
     # ----- settings tab -----
     def build_settings_tab(self):
         saved = load_json(SETTINGS_PATH, {})
-        candidates = [STATE_HOME / "Beyond All Reason", Path.home() / ".local/state/Beyond All Reason"]
+        if IS_WINDOWS:
+            local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+            candidates = [
+                local / "Programs" / "Beyond-All-Reason" / "data",
+                local / "Programs" / "Beyond All Reason" / "data",
+                local / "Beyond-All-Reason" / "data",
+                Path(os.environ.get("APPDATA") or Path.home() / "AppData/Roaming") / "Beyond All Reason" / "data",
+            ]
+        else:
+            candidates = [STATE_HOME / "Beyond All Reason", Path.home() / ".local/state/Beyond All Reason"]
         default_data = next((c for c in candidates if c.is_dir()), candidates[0])
         self.tab_settings = QWidget()
         g = QGridLayout(self.tab_settings)
@@ -1016,11 +1126,18 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("BAR data folder"), 0, 0, 1, 2)
         g.addWidget(self.tb_data, 1, 0)
         g.addWidget(self.button("Browse…", lambda: self.browse(self.tb_data, "Select the Beyond All Reason data folder")), 1, 1)
-        g.addWidget(QLabel("Engine folder (contains the 'spring' executable)"), 2, 0, 1, 2)
+        executable_name = "spring.exe" if IS_WINDOWS else "spring"
+        g.addWidget(QLabel(f"Engine folder (contains {executable_name})"), 2, 0, 1, 2)
         g.addWidget(self.tb_engine, 3, 0)
-        g.addWidget(self.button("Browse…", lambda: self.browse(self.tb_engine, "Select the engine folder that contains spring")), 3, 1)
-        g.addWidget(self.hint("Default data folder is ~/.local/state/Beyond All Reason. If BAR updates to another engine "
-                              "version, click Detect engine or select the new engine folder here."), 4, 0, 1, 2)
+        g.addWidget(self.button("Browse…", lambda: self.browse(self.tb_engine, f"Select the engine folder that contains {executable_name}")), 3, 1)
+        if IS_WINDOWS:
+            hint = (r"Windows default: %LOCALAPPDATA%\Programs\Beyond-All-Reason\data. "
+                    "The BAR data folder should contain an engine subfolder. If BAR updates to another engine version, "
+                    "click Detect engine or choose the new engine folder.")
+        else:
+            hint = ("Default data folder is ~/.local/state/Beyond All Reason. If BAR updates to another engine "
+                    "version, click Detect engine or select the new engine folder here.")
+        g.addWidget(self.hint(hint), 4, 0, 1, 2)
         row = QHBoxLayout()
         row.addWidget(self.button("Save settings", self.on_save_settings))
         row.addWidget(self.button("Detect engine", self.on_detect_engine))
@@ -1030,7 +1147,8 @@ class MainWindow(QMainWindow):
         g.addLayout(row, 5, 0, 1, 2)
         g.setRowStretch(6, 1)
         g.setColumnStretch(0, 1)
-        if not self.tb_engine.text() or not (Path(self.tb_engine.text()) / "spring").is_file():
+        engine_name = "spring.exe" if IS_WINDOWS else "spring"
+        if not self.tb_engine.text() or not (Path(self.tb_engine.text()) / engine_name).is_file():
             try:
                 self.tb_engine.setText(str(self.find_engines()[0].parent))
             except Exception:
@@ -1043,10 +1161,12 @@ class MainWindow(QMainWindow):
 
     def find_engines(self):
         root = Path(self.tb_data.text().strip()).expanduser() / "engine"
+        exe_name = "spring.exe" if IS_WINDOWS else "spring"
         found = []
         if root.is_dir():
+            # Each BAR engine version normally has its own directory. Look one level down.
             for d in root.iterdir():
-                exe = d / "spring"
+                exe = d / exe_name
                 if exe.is_file():
                     found.append(exe)
         found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1057,13 +1177,14 @@ class MainWindow(QMainWindow):
         if not data.is_dir():
             raise UserError(f"BAR data folder does not exist:\n{data}\nOpen Settings and choose the correct data folder.")
         eng = self.tb_engine.text().strip()
-        if eng and (Path(eng) / "spring").is_file():
-            return Path(eng) / "spring"
+        exe_name = "spring.exe" if IS_WINDOWS else "spring"
+        if eng and (Path(eng) / exe_name).is_file():
+            return Path(eng) / exe_name
         engines = self.find_engines()
         if engines:
             self.tb_engine.setText(str(engines[0].parent))
             return engines[0]
-        raise UserError(f"Could not find the 'spring' executable. Current engine folder:\n{eng}\n"
+        raise UserError(f"Could not find the '{exe_name}' executable. Current engine folder:\n{eng}\n"
                         "Use Settings → Browse next to Engine folder.")
 
     @guarded
@@ -1183,7 +1304,9 @@ class MainWindow(QMainWindow):
         ag.setColumnStretch(4, 1)
         g.addWidget(adv, 5, 0, 1, 3)
 
-        box = QGroupBox("Address for far-away friends (Proton VPN if connected, otherwise public IP)")
+        address_title = ("Address for far-away friends (public/VPN IP)" if IS_WINDOWS else
+                         "Address for far-away friends (Proton VPN if connected, otherwise public IP)")
+        box = QGroupBox(address_title)
         bg = QGridLayout(box)
         self.lbl_lan = QLabel("Your LAN IP: " + get_lan_ipv4())
         self.lbl_public = QLabel("Address: (click Detect)")
@@ -1198,10 +1321,15 @@ class MainWindow(QMainWindow):
         bg.addWidget(self.button("Copy invites", self.on_copy_invite), 1, 2)
         bg.setColumnStretch(0, 1)
         g.addWidget(box, 6, 0, 1, 3)
-        g.addWidget(self.hint("For internet play: with Proton VPN enable Port Forwarding and use a P2P server (the port is set "
-                              "automatically); otherwise forward the UDP port on your router. Start boxes only matter for "
-                              "'Choose in game'. If the team count doesn't fit a 2-team box preset, vertical strips are used."),
-                    7, 0, 1, 3)
+        if IS_WINDOWS:
+            network_hint = ("For internet play on Windows: if using Proton VPN, enable Port Forwarding on a P2P server and "
+                            "manually enter the active forwarded port shown in the Proton app into Host port. Otherwise, "
+                            "forward the chosen UDP port on your router and allow it through Windows Firewall. ")
+        else:
+            network_hint = ("For internet play: with Proton VPN enable Port Forwarding and use a P2P server (the port is set "
+                            "automatically); otherwise forward the UDP port on your router. ")
+        g.addWidget(self.hint(network_hint + "Start boxes only matter for 'Choose in game'. If the team count doesn't fit "
+                              "a 2-team box preset, vertical strips are used."), 7, 0, 1, 3)
         g.setRowStretch(8, 1)
         g.setColumnStretch(1, 1)
         self.host_tabs.addTab(page, "Match")
@@ -1222,22 +1350,32 @@ class MainWindow(QMainWindow):
         top.addWidget(self.button("Add spectator", self.on_add_spectator))
         top.addWidget(self.button("Add bot", self.on_add_bot))
         top.addWidget(self.button("Remove selected", self.on_remove_row))
+        top.addSpacing(12)
+        top.addWidget(QLabel("Shared join password:"))
+        self.tb_host_password = QLineEdit()
+        self.tb_host_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tb_host_password.setPlaceholderText("Set one password for everyone")
+        self.tb_host_password.setMaximumWidth(190)
+        self.tb_host_password.setToolTip("Every human player and spectator uses this same password.")
+        self.tb_host_password.textChanged.connect(lambda _=None: self.on_refresh_preview_if_ready())
+        top.addWidget(self.tb_host_password)
         top.addStretch(1)
         v.addLayout(top)
         self.players = PlayerTable(self)
         v.addWidget(self.players, 1)
         host_row = self.players.add_row("host", name="gonj183notAlex", ally=1)
         self.tb_host_name = host_row["name"]
-        self.players.add_row("human", name="FriendName", password="awe123", ally=2)
+        self.players.add_row("human", name="FriendName", ally=2)
         v.addWidget(self.hint("Up to 8 humans in total (you + friends + spectators) and up to 16 players and bots. Teams with the same "
-                              "number are allies. Bots: 'Bot (Skirmish AI)' are engine AIs; 'Lua AI' covers Scavengers/Raptors. "
-                              "Bonus % is a resource handicap. Passwords are visible here. Each friend enters their own name and password "
-                              "when joining."))
+                              "number are allies. Choose a faction from Armada, Cortex, Legion, or Awesome. Bot / AI is a dropdown; "
+                              "if installed AI metadata is not loaded, common BAR engine AI choices are shown. Set one shared join "
+                              "password above; every friend or spectator uses that same password along with their assigned player name."))
         self.host_tabs.addTab(page, "Players && teams")
 
         # ---- Options pages ----
+        unitsync_name = "unitsync.dll" if IS_WINDOWS else "libunitsync.so"
         self.game_panel = OptionsPanel("Game options are read from your installed BAR game. Click 'Refresh maps & options' "
-                                       "on the Match tab (needs the engine's libunitsync.so) to load them.")
+                                       f"on the Match tab (needs the engine's {unitsync_name}) to load them.")
         self.map_panel = OptionsPanel("This map has no special map options.")
         self.host_tabs.addTab(self.game_panel, "Game options")
         self.host_tabs.addTab(self.map_panel, "Map options")
@@ -1275,11 +1413,11 @@ class MainWindow(QMainWindow):
 
     @guarded
     def on_add_friend(self):
-        self.players.add_row("human", password=secrets.token_hex(3))
+        self.players.add_row("human")
 
     @guarded
     def on_add_spectator(self):
-        self.players.add_row("spec", password=secrets.token_hex(3))
+        self.players.add_row("spec")
 
     @guarded
     def on_add_bot(self):
@@ -1288,6 +1426,10 @@ class MainWindow(QMainWindow):
     @guarded
     def on_remove_row(self):
         self.players.remove_selected()
+
+    def on_refresh_preview_if_ready(self):
+        if hasattr(self, "txt_preview"):
+            self.on_refresh_preview()
 
     @guarded
     def on_refresh_preview(self):
@@ -1306,16 +1448,15 @@ class MainWindow(QMainWindow):
         self.tb_join_port = QLineEdit("8452")
         self.tb_join_port.setMaximumWidth(120)
         self.tb_join_name = QLineEdit("FriendName")
-        self.tb_join_pass = QLineEdit("awe123")
+        self.tb_join_pass = QLineEdit()
         self.tb_join_pass.setEchoMode(QLineEdit.EchoMode.Password)
         rows = [("Host IPv4 address (public IP for internet)", self.tb_join_ip), ("Host port", self.tb_join_port),
                 ("Your in-game player name", self.tb_join_name), ("Match password", self.tb_join_pass)]
         for i, (label, w) in enumerate(rows):
             g.addWidget(QLabel(label), i, 0)
             g.addWidget(w, i, 1)
-        g.addWidget(self.hint("Use the host's public IP (or LAN IP if on the same network), port, player name, and password "
-                              "from their invite. Your player name and password must exactly match the values assigned for "
-                              "you by the host."), 4, 0, 1, 2)
+        g.addWidget(self.hint("Use the host's public IP (or LAN IP if on the same network), port, your assigned player name, "
+                              "and the one shared join password chosen by the host."), 4, 0, 1, 2)
         row = QHBoxLayout()
         row.addWidget(self.button("Save join script", self.on_save_join))
         row.addWidget(self.button("JOIN MATCH", self.on_join, bold=True))
@@ -1354,6 +1495,8 @@ class MainWindow(QMainWindow):
             raise UserError(f"At most {MAX_HUMANS} humans (you, friends and spectators) are supported.")
         if not teamslots:
             raise UserError("At least one non-spectator slot is needed.")
+        if any(s["kind"] in ("human", "spec") for s in slots):
+            test_text_value(self.tb_host_password.text(), "Shared join password")
         if len(teamslots) > MAX_SLOTS:
             raise UserError(f"At most {MAX_SLOTS} players + bots are supported.")
         seen = set()
@@ -1364,8 +1507,7 @@ class MainWindow(QMainWindow):
             if s["name"].lower() in seen:
                 raise UserError(f"Names must be unique. '{s['name']}' is used more than once.")
             seen.add(s["name"].lower())
-            if s["kind"] in ("human", "spec"):
-                test_text_value(s["password"], f"Password for {s['name']}")
+            # All human/spectator PLAYER entries receive the single shared password below.
             if s["kind"] in ("ai", "luaai"):
                 if not s["ai"] or not s["ai"][1]:
                     raise UserError(f"Choose a bot type for '{s['name']}'.")
@@ -1423,7 +1565,9 @@ class MainWindow(QMainWindow):
             L.append("    {")
             kv(2, "Name", s["name"])
             if s["kind"] != "host":
-                kv(2, "Password", s["password"])
+                # Spring start scripts associate passwords with player names. Reuse one
+                # host-controlled password for every non-host human/spectator slot.
+                kv(2, "Password", self.tb_host_password.text())
             kv(2, "Team", tid.get(id(s), 0))
             kv(2, "Spectator", 1 if s["kind"] == "spec" else 0)
             L.append("    }")
@@ -1513,17 +1657,34 @@ class MainWindow(QMainWindow):
         exe = self.get_engine_exe()
         data = str(Path(self.tb_data.text().strip()).expanduser())
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        log = open(APP_DIR / "last_engine.log", "wb")
-        subprocess.Popen([str(exe), "--write-dir", data, str(script_path)], cwd=str(exe.parent),
-                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        log_path = APP_DIR / "last_engine.log"
+        kwargs = {"cwd": str(exe.parent), "stdout": open(log_path, "wb"), "stderr": subprocess.STDOUT}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            subprocess.Popen([str(exe), "--write-dir", data, str(script_path)], **kwargs)
+        except Exception:
+            kwargs["stdout"].close()
+            raise
         self.set_status(f"{activity} started. If BAR opens but fails to connect, check script values and your firewall "
-                        f"(engine log: {APP_DIR / 'last_engine.log'}).")
+                        f"(engine log: {log_path}).")
 
     # ----- connection endpoint (Proton VPN or direct) -----
     def resolve_host_endpoint(self):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
+            if IS_WINDOWS:
+                # Proton's Windows app displays its active forwarded port in its UI.
+                # Do not run Linux `ip`/NAT-PMP discovery on Windows; use the user-entered
+                # Host port, which should match Proton's active port when a VPN is in use.
+                self.pmp_timer.stop()
+                ip = get_public_ipv4()
+                if not ip:
+                    raise UserError("Could not detect your public/VPN IP. Check your internet connection.")
+                return {"mode": "windows_manual", "ip": ip, "port": test_port(self.tb_host_port.text().strip())}
             iface = get_proton_iface()
             if iface:
                 gws = get_proton_gateways(iface)
@@ -1572,6 +1733,10 @@ class MainWindow(QMainWindow):
         if ep["mode"] == "proton":
             self.lbl_public.setText(f"Proton VPN: {ep['ip']} : {ep['port']}")
             self.set_status(f"Using Proton VPN port forwarding. Friends connect to {ep['ip']} port {ep['port']}.")
+        elif ep["mode"] == "windows_manual":
+            self.lbl_public.setText(f"Public/VPN IP: {ep['ip']} : {ep['port']}")
+            self.set_status("Windows mode: if using Proton VPN, set Host port to the active forwarded port shown in Proton; "
+                            "otherwise forward the UDP port on your router.")
         else:
             self.lbl_public.setText(f"Public IP: {ep['ip']}")
             self.set_status(f"No Proton VPN detected. Using your public IP. Forward UDP {ep['port']} on your router.")
@@ -1581,16 +1746,29 @@ class MainWindow(QMainWindow):
         friends = [s for s in self.players.slots() if s["kind"] in ("human", "spec")]
         if not friends:
             raise UserError("Add at least one friend or spectator on the Players & teams tab first.")
+        test_text_value(self.tb_host_password.text(), "Shared join password")
         ep = self.resolve_host_endpoint()
-        self.lbl_public.setText((f"Proton VPN: {ep['ip']} : {ep['port']}" if ep["mode"] == "proton" else f"Public IP: {ep['ip']}"))
+        if ep["mode"] == "proton":
+            self.lbl_public.setText(f"Proton VPN: {ep['ip']} : {ep['port']}")
+        elif ep["mode"] == "windows_manual":
+            self.lbl_public.setText(f"Public/VPN IP: {ep['ip']} : {ep['port']}")
+        else:
+            self.lbl_public.setText(f"Public IP: {ep['ip']}")
         blocks = []
         for s in friends:
             role = "  (spectator)" if s["kind"] == "spec" else ""
             blocks.append(f"Awesome BAR match\nHost IP: {ep['ip']}\nPort: {self.tb_host_port.text().strip()}\n"
-                          f"Map: {self.tb_map.currentText().strip()}\nYour player name: {s['name']}{role}\nPassword: {s['password']}")
+                          f"Map: {self.tb_map.currentText().strip()}\nYour player name: {s['name']}{role}\n"
+                          f"Shared password: {self.tb_host_password.text()}")
         QApplication.clipboard().setText("\n\n------------------------------\n\n".join(blocks))
-        self.set_status(f"Invites for {len(friends)} friend(s) copied, one block each. Send each block privately. "
-                        "(Direct IP mode needs router port forwarding.)")
+        if IS_WINDOWS:
+            note = ("If using Proton VPN, the Host port must match the active forwarded port shown in Proton; "
+                    "otherwise forward that UDP port on your router.")
+        elif ep["mode"] == "proton":
+            note = "Proton VPN port forwarding is active; share the displayed IP and port."
+        else:
+            note = "Direct IP mode needs router UDP port forwarding."
+        self.set_status(f"Invites for {len(friends)} friend(s) copied, one block each. Send each block privately. {note}")
 
     @guarded
     def on_save_host(self):
@@ -1621,6 +1799,29 @@ class MainWindow(QMainWindow):
     @guarded
     def on_firewall(self):
         port = test_port(self.tb_host_port.text().strip())
+        self.set_status(f"Requesting a firewall rule for inbound UDP {port}...")
+        QApplication.processEvents()
+        if IS_WINDOWS:
+            # Start an elevated PowerShell process, which then runs netsh. A UAC prompt
+            # is expected. The rule is persistent and named for this port.
+            rule_name = f"Awesome_BAR_UDP_{port}"
+            ps_command = (
+                f"$netshArgs = 'advfirewall firewall add rule name={rule_name} dir=in action=allow protocol=UDP localport={port}'; "
+                "$p = Start-Process -FilePath 'netsh.exe' -ArgumentList $netshArgs -Verb RunAs -Wait -PassThru; "
+                "exit $p.ExitCode"
+            )
+            try:
+                r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
+                                   capture_output=True, text=True, timeout=180)
+            except subprocess.TimeoutExpired:
+                raise UserError("Timed out waiting for Windows Firewall approval. Try again and accept the UAC prompt.")
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout).strip()
+                raise UserError("Could not add the Windows Firewall rule. Accept the UAC prompt when it appears.\n"
+                                f"{detail or 'The elevated netsh command did not succeed.'}")
+            self.set_status(f"Windows Firewall rule added for inbound UDP {port}.")
+            return
+
         if shutil.which("ufw"):
             cmd = ["pkexec", "ufw", "allow", f"{port}/udp"]
         elif shutil.which("firewall-cmd"):
@@ -1628,8 +1829,6 @@ class MainWindow(QMainWindow):
         else:
             raise UserError(f"No ufw or firewalld was found. If you use nftables/iptables, allow inbound UDP port {port} "
                             "manually. If you have no firewall enabled, nothing needs to be done.")
-        self.set_status(f"Requesting firewall rule for inbound UDP {port} (approve the authentication prompt)...")
-        QApplication.processEvents()
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
             raise UserError(f"Firewall command failed:\n{' '.join(cmd)}\n\n{(r.stderr or r.stdout).strip()}")
@@ -1642,7 +1841,8 @@ class MainWindow(QMainWindow):
         for s in self.players.slots():
             rows.append({"kind": s["kind"], "name": s["name"], "password": s["password"], "ally": s["ally"],
                          "ai": s["ai_text"], "bonus": s["bonus"], "side": s["side"], "color": list(s["color"])})
-        return {"version": 1, "map": self.tb_map.currentText().strip(), "port": self.tb_host_port.text().strip(),
+        return {"version": 2, "shared_password": self.tb_host_password.text(),
+                "map": self.tb_map.currentText().strip(), "port": self.tb_host_port.text().strip(),
                 "startpos": self.cb_startpos.currentData(), "startbox": self.cb_startbox.currentData(),
                 "custom_boxes": self.tb_custom_boxes.toPlainText(), "min_speed": self.tb_min_speed.text(),
                 "max_speed": self.tb_max_speed.text(), "start_delay": self.tb_start_delay.text(), "seed": self.tb_seed.text(),
@@ -1663,6 +1863,13 @@ class MainWindow(QMainWindow):
         self.tb_seed.setText(d.get("seed", ""))
         self.chk_no_damage.setChecked(bool(d.get("no_damage", False)))
         players = d.get("players") or []
+        # Version-1 presets had individual passwords; migrate the first one found to
+        # the new shared password setting.
+        shared_password = d.get("shared_password")
+        if shared_password is None:
+            shared_password = next((p.get("password", "") for p in players[1:]
+                                    if p.get("kind", "human") in ("human", "spec") and p.get("password")), "")
+        self.tb_host_password.setText(str(shared_password or ""))
         if players:
             self.players.clear_non_host()
             self.tb_host_name.setText(players[0].get("name", self.tb_host_name.text()))
@@ -1670,7 +1877,9 @@ class MainWindow(QMainWindow):
             hr["team"].setValue(int(players[0].get("ally", 1)))
             hr["bonus"].setValue(int(players[0].get("bonus", 0)))
             if players[0].get("side"):
-                hr["side"].setEditText(players[0]["side"])
+                side_index = hr["side"].findText(str(players[0]["side"]))
+                if side_index >= 0:
+                    hr["side"].setCurrentIndex(side_index)
             if players[0].get("color"):
                 hr["color"] = tuple(players[0]["color"])
                 self.players.paint_color(hr)
@@ -1802,10 +2011,15 @@ class MainWindow(QMainWindow):
         data = str(Path(self.tb_data.text().strip()).expanduser())
         env = QProcessEnvironment.systemEnvironment()
         env.insert("SPRING_DATADIR", data)
-        ld = env.value("LD_LIBRARY_PATH", "")
-        env.insert("LD_LIBRARY_PATH", engine_dir + (":" + ld if ld else ""))
+        if IS_WINDOWS:
+            path_value = env.value("PATH", "")
+            env.insert("PATH", engine_dir + (os.pathsep + path_value if path_value else ""))
+        else:
+            ld = env.value("LD_LIBRARY_PATH", "")
+            env.insert("LD_LIBRARY_PATH", engine_dir + (":" + ld if ld else ""))
         proc = QProcess(self)
         proc.setProcessEnvironment(env)
+        proc.setWorkingDirectory(engine_dir)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.finished.connect(self.on_scan_finished)
         self.scan_proc = proc
