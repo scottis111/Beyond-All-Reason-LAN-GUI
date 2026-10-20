@@ -14,3 +14,5 @@ Caching: the first scan runs automatically when the window opens and may take a 
 Refresh map list: this button rescans after you install new maps.
 
 Typing a map: you can still type a title by hand, since the dropdown is editable.
+
+Note: There is a Arch Linux version of GUI files.
