@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 2
-SCRIPT="$SCRIPT_DIR/awesome_bar_lan_gui_arch.py"
+SCRIPT="$SCRIPT_DIR/awesome_bar_lan_gui_Linux_arch.py"
 
 pause_if_interactive() {
     if [[ -t 0 ]]; then
@@ -22,7 +22,7 @@ fail() {
 cd -- "$SCRIPT_DIR" || fail 2 "Could not change to the application folder."
 
 if [[ ! -f "$SCRIPT" ]]; then
-    fail 2 "awesome_bar_lan_gui_arch.py was not found beside this launcher. Keep both files in the same folder."
+    fail 2 "awesome_bar_lan_gui_Linux_arch.py was not found beside this launcher. Keep both files in the same folder."
 fi
 
 PYTHON_CMD="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
