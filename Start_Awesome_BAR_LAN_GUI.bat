@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-set "SCRIPT=%~dp0awesome_bar_lan_gui_windows.py"
+set "SCRIPT=%~dp0awesome_bar_lan_gui.py"
 
 if not exist "%SCRIPT%" (
-    echo ERROR: awesome_bar_lan_gui_windows.py was not found in this folder.
+    echo ERROR: awesome_bar_lan_gui.py was not found in this folder.
     echo Keep this batch file in the same folder as the Python program.
     pause
     exit /b 2
