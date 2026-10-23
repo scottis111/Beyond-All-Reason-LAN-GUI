@@ -1,5 +1,7 @@
 AWESOME BAR LAN LOBBY - WINDOWS BUILD
 
+This is a GUI lobby to interface with the BAR.sdd folder which has the modded Beyond All Reason content folder.
+
 FILES
 - awesome_bar_lan_gui_windows.py: Windows-adapted application
 - Run_Awesome_BAR_LAN_GUI_Windows.bat: launcher; checks Python and offers to install PyQt6
